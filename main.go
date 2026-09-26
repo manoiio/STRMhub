@@ -18,6 +18,7 @@ import (
 
 	"strmhub/internal/api"
 	"strmhub/internal/config"
+	"strmhub/internal/logging"
 	"strmhub/internal/model"
 
 	"github.com/gin-contrib/cors"
@@ -102,6 +103,20 @@ func main() {
 		return
 	}
 
+	// 日志路径由共享 logging 包解析，确保网页日志接口读取与写入相同文件。
+	logFile, logPath, logErr := logging.OpenAppLog()
+	if logErr != nil {
+		log.Printf("创建或打开日志文件失败: %v，日志仅输出到控制台", logErr)
+	} else {
+		defer logFile.Close()
+		rw := &rotatingWriter{f: logFile, path: logPath, maxBytes: 10 << 20, keep: 3}
+		if st, err := logFile.Stat(); err == nil {
+			rw.size = st.Size()
+		}
+		log.SetOutput(io.MultiWriter(os.Stdout, rw))
+		log.Printf("[系统] 实时日志文件: %s", logPath)
+	}
+
 	// 初始化配置
 	cfg := config.Load()
 
@@ -134,24 +149,6 @@ func main() {
 	}
 
 	log.Println(cfg.ConfigSummary())
-
-	// 确保日志目录存在（app.log 大小轮转：超 10MB 切割，保留最近 3 份，
-	// 防止长期运行无限追加撑爆磁盘）
-	logDir := "/logs"
-	if err := os.MkdirAll(logDir, 0755); err != nil {
-		log.Printf("创建日志目录失败: %v，日志仅输出到控制台", err)
-	} else {
-		logPath := filepath.Join(logDir, "app.log")
-		logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err == nil {
-			defer logFile.Close()
-			rw := &rotatingWriter{f: logFile, path: logPath, maxBytes: 10 << 20, keep: 3}
-			if st, serr := logFile.Stat(); serr == nil {
-				rw.size = st.Size()
-			}
-			log.SetOutput(io.MultiWriter(os.Stdout, rw))
-		}
-	}
 
 	// 初始化数据库（分类策略、洗版策略、同步记录）
 	db, err := model.InitDB(filepath.Join(cfg.DataDir, "strmhub.db"))

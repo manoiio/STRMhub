@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"strmhub/internal/config"
+	"strmhub/internal/logging"
 	"strmhub/internal/model"
 	"sync"
 	"time"
@@ -507,7 +508,7 @@ func SetupRoutes(r *gin.RouterGroup, db *gorm.DB, cfg *config.Config) {
 		// 实时日志长轮询：带上次修改时间 since，日志有新内容立即返回，
 		// 25 秒无变化返回 changed=false（前端随即再次挂起，实现"有日志就出现"）
 		protected.GET("/system/logs/wait", func(c *gin.Context) {
-			logPath := "/logs/app.log"
+			logPath := logging.ActivePath()
 			var since int64
 			fmt.Sscanf(c.Query("since"), "%d", &since)
 			deadline := time.Now().Add(25 * time.Second)
@@ -530,7 +531,7 @@ func SetupRoutes(r *gin.RouterGroup, db *gorm.DB, cfg *config.Config) {
 		})
 		// 清空任务日志：截断 app.log（追加模式写入器继续写同一文件）
 		protected.POST("/system/logs/clear", func(c *gin.Context) {
-			logPath := "/logs/app.log"
+			logPath := logging.ActivePath()
 			if err := os.Truncate(logPath, 0); err != nil {
 				if os.IsNotExist(err) {
 					c.JSON(http.StatusOK, gin.H{"message": "日志本来就为空"})
@@ -1406,10 +1407,10 @@ func (h *Handler) SaveWashRules(c *gin.Context) {
 // GetSystemLogs 读取系统日志文件最后 500 行
 // GET /system/logs（日志页唯一数据源：整理/同步/转存等任务动作的实时输出）
 func (h *Handler) GetSystemLogs(c *gin.Context) {
-	logPath := "/logs/app.log"
+	logPath := logging.ActivePath()
 	data, err := os.ReadFile(logPath)
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{"logs": "暂无日志文件（日志文件在 /logs/app.log）"})
+		c.JSON(http.StatusOK, gin.H{"logs": fmt.Sprintf("暂无日志文件（日志文件位置：%s）", logPath)})
 		return
 	}
 	lines := strings.Split(string(data), "\n")
