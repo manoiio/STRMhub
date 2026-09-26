@@ -487,10 +487,21 @@ func StartOfflineTaskMonitor(h *Handler) {
 		lastStatus := map[string]int{} // info_hash/url → 上次状态
 		notified := map[string]bool{}  // 已处理过的终态任务（避免重复告警/触发）
 		for {
+			if !serviceToggleEnabled(h, offlineTaskMonitorSettingKey, true) {
+				select {
+				case <-stopCh:
+					return
+				case <-time.After(time.Minute):
+				}
+				continue
+			}
 			select {
 			case <-stopCh:
 				return
 			case <-time.After(offlineNextPollDelay()):
+			}
+			if !serviceToggleEnabled(h, offlineTaskMonitorSettingKey, true) {
+				continue
 			}
 			cookie, err := h.get115Cookie()
 			if err != nil {
@@ -499,6 +510,9 @@ func StartOfflineTaskMonitor(h *Handler) {
 			tasks, err := fetchOfflineTaskList(cookie)
 			if err != nil {
 				continue // 网络抖动/接口拒绝：下轮再看
+			}
+			if !serviceToggleEnabled(h, offlineTaskMonitorSettingKey, true) {
+				continue // 请求期间关闭开关：不处理任务或触发自动整理
 			}
 			mine := offlineMineLoad(h) // StrmHub 提交的归属标记（App 里提交的不在标记内 → 不通知）
 			// 本轮新完成的任务（聚合为一条通知+一次整理触发，防止批量完成时
@@ -539,6 +553,9 @@ func StartOfflineTaskMonitor(h *Handler) {
 					failedNames = append(failedNames, truncateStr(t.name, 80))
 					notified[key] = true
 				}
+			}
+			if !serviceToggleEnabled(h, offlineTaskMonitorSettingKey, true) {
+				continue // 处理期间关闭开关：不发送通知或触发整理
 			}
 			// 聚合通知：本轮全部新完成/失败合并为一条（名称列表截断防超长）
 			clip := func(names []string, keep int) string {

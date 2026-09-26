@@ -633,31 +633,40 @@ var metadataUploadNames = map[string]bool{
 // 这里针对的是媒体卷内、随剧集目录存放的元数据文件
 func StartMetadataUploader(h *Handler) {
 	// 监控上传（monitor 配置）已覆盖同一职责且更可配（目录自选）；
-	// 本引擎仅在监控目录未配置时作为兜底启用，避免双路重复上传
-	var mc struct {
-		Dir string `json:"dir"`
-	}
-	_ = json.Unmarshal([]byte(h.getSettingValue("monitor")), &mc)
-	if mc.Dir != "" {
-		return // 监控上传已启用，兜底引擎休眠
-	}
+	// 本引擎仅在开关开启且未配置监控目录时作为兜底启用，避免双路重复上传。
+	// 每轮重新读配置，让 UI 开关和监控目录调整无需重启即可生效。
 	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-stopCh:
 				return
-			case <-time.After(5 * time.Minute):
+			case <-ticker.C:
+			}
+			if !serviceToggleEnabled(h, metadataFallbackSettingKey, true) || metadataMonitorDirectoryConfigured(h) {
+				continue
 			}
 			h.uploadMetadataOnce()
 		}
 	}()
-	log.Println("[元数据回传] 兜底引擎已启动（未配置监控目录；每 5 分钟扫描媒体目录）")
+	log.Println("[元数据回传] 兜底引擎已启动（开关开启且未配置监控目录时，每 5 分钟扫描媒体目录）")
+}
+
+func metadataMonitorDirectoryConfigured(h *Handler) bool {
+	var cfg struct {
+		Dir string `json:"dir"`
+	}
+	return json.Unmarshal([]byte(h.getSettingValue("monitor")), &cfg) == nil && cfg.Dir != ""
 }
 
 // uploadMetadataOnce 单轮回传
 var metadataRunning atomic.Bool
 
 func (h *Handler) uploadMetadataOnce() {
+	if !serviceToggleEnabled(h, metadataFallbackSettingKey, true) || metadataMonitorDirectoryConfigured(h) {
+		return
+	}
 	if !metadataRunning.CompareAndSwap(false, true) {
 		return
 	}

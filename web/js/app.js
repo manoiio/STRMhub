@@ -186,7 +186,10 @@ function showPage(id) {
     loadWash();
   }
   if (id === 'sync') { loadConfigs(); previewCron(); pan123LoadUI(); }
-  if (id === 'upload-download') { loadConfigs(); startOfflineTasksPoll(); }
+  if (id === 'upload-download') {
+    loadConfigs();
+    loadUploadDownloadToggles().then(startOfflineTasksPoll);
+  }
   else stopOfflineTasksPoll();
   if (id === 'media-transfer') { gyLoadPage(); pansouLoadPage(); mukakuLoadPage(); re0LoadPage(); }
   if (id === 'cd2') cd2LoadUI();
@@ -922,7 +925,94 @@ function setTransferOrganize(v, silent) {
 let offlineTasksTimer = null;
 let offlineTasksCache = [];
 let offlineTasksPage = 1;
+let offlineTaskMonitorEnabled = true;
+let offlineTaskMonitorConfigLoaded = false;
+let metadataFallbackEnabled = true;
+let metadataFallbackConfigLoaded = false;
 const OFFLINE_PAGE_SIZE = 20;
+
+function renderBackgroundServiceToggle(elementId, enabled, busy = false) {
+  const group = document.getElementById(elementId);
+  if (!group) return;
+  group.querySelectorAll('.seg-item').forEach(button => {
+    const selected = String(button.dataset.value) === String(enabled);
+    button.classList.toggle('active', selected);
+    button.setAttribute('aria-pressed', String(selected));
+    button.disabled = busy;
+  });
+}
+
+function parseBackgroundServiceEnabled(value, defaultEnabled = true) {
+  if (!value) return defaultEnabled;
+  try {
+    const cfg = JSON.parse(value);
+    return typeof cfg.enabled === 'boolean' ? cfg.enabled : false;
+  } catch (_) { return false; }
+}
+
+async function loadUploadDownloadToggles() {
+  const settings = [
+    ['offline-task-monitor', 'offline-monitor-switch'],
+    ['metadata-upload-fallback', 'metadata-fallback-switch'],
+  ];
+  const results = await Promise.all(settings.map(async ([key]) => {
+    try {
+      const data = await api('/config/setting?key=' + encodeURIComponent(key));
+      return { ok: true, enabled: parseBackgroundServiceEnabled(data.value, true) };
+    } catch (_) { return { ok: false, enabled: false }; }
+  }));
+
+  offlineTaskMonitorConfigLoaded = results[0].ok;
+  offlineTaskMonitorEnabled = results[0].enabled;
+  metadataFallbackConfigLoaded = results[1].ok;
+  metadataFallbackEnabled = results[1].enabled;
+  renderBackgroundServiceToggle('offline-monitor-switch', offlineTaskMonitorEnabled);
+  renderBackgroundServiceToggle('metadata-fallback-switch', metadataFallbackEnabled);
+  if (!offlineTaskMonitorConfigLoaded) {
+    const hint = document.getElementById('offline-tasks-hint');
+    if (hint) hint.textContent = '开关状态读取失败；自动刷新已暂停，可手动查询';
+  }
+  if (!results[1].ok) {
+    const hint = document.getElementById('metadata-fallback-hint');
+    if (hint) hint.textContent = '开关状态读取失败；请重新加载页面后确认状态。已配置监控目录时，独立监控上传仍按原配置运行。';
+  } else {
+    const hint = document.getElementById('metadata-fallback-hint');
+    if (hint) hint.textContent = '仅在「监控目录」未配置时生效。开启后每 5 分钟扫描媒体库并把 Emby 写入的 NFO、海报等回传 115；关闭后停止后续兜底扫描，正在执行的一轮会完成。已配置监控目录时，独立的「监控上传」仍按原配置运行。';
+  }
+}
+
+async function saveBackgroundServiceToggle(key, enabled) {
+  const isOfflineMonitor = key === 'offline-task-monitor';
+  const elementId = isOfflineMonitor ? 'offline-monitor-switch' : 'metadata-fallback-switch';
+  const current = isOfflineMonitor ? offlineTaskMonitorEnabled : metadataFallbackEnabled;
+  const loaded = isOfflineMonitor ? offlineTaskMonitorConfigLoaded : metadataFallbackConfigLoaded;
+  if (enabled === current && loaded) return;
+  renderBackgroundServiceToggle(elementId, current, true);
+  try {
+    await api('/config/setting', {
+      method: 'POST',
+      body: JSON.stringify({ key, value: JSON.stringify({ enabled }) }),
+    });
+    if (isOfflineMonitor) {
+      offlineTaskMonitorEnabled = enabled;
+      offlineTaskMonitorConfigLoaded = true;
+      if (enabled) startOfflineTasksPoll();
+      else {
+        stopOfflineTasksPoll();
+        const hint = document.getElementById('offline-tasks-hint');
+        if (hint) hint.textContent = '自动监视已关闭 · 点击刷新可手动查询';
+      }
+    } else {
+      metadataFallbackEnabled = enabled;
+      metadataFallbackConfigLoaded = true;
+    }
+    renderBackgroundServiceToggle(elementId, enabled);
+    toast(enabled ? '后台服务已开启' : '后台服务已关闭');
+  } catch (e) {
+    renderBackgroundServiceToggle(elementId, current);
+    toast('保存失败：' + e.message);
+  }
+}
 
 async function loadOfflineTasks() {
   const box = document.getElementById('offline-tasks');
@@ -1027,6 +1117,13 @@ function offlineTasksNav(d) {
 }
 function startOfflineTasksPoll() {
   stopOfflineTasksPoll();
+  if (!offlineTaskMonitorConfigLoaded || !offlineTaskMonitorEnabled) {
+    const hint = document.getElementById('offline-tasks-hint');
+    if (hint) hint.textContent = offlineTaskMonitorConfigLoaded
+      ? '自动监视已关闭 · 点击刷新可手动查询'
+      : '开关状态读取失败；自动刷新已暂停，可手动查询';
+    return;
+  }
   loadOfflineTasks();
   offlineTasksTimer = setInterval(() => {
     const page = document.getElementById('page-upload-download');
