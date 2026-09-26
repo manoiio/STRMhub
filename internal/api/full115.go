@@ -558,8 +558,17 @@ func (h *Handler) getStrmConfig() (domain, format string, keepExt, exist bool) {
 	format = "pick_code_name"
 	keepExt = true
 	exist = false // false=覆盖
-	var s model.Setting
-	if err := h.DB.Where("key = ?", "strm").First(&s).Error; err != nil {
+	raw := ""
+	if h.Config != nil {
+		raw = h.Config.GetSetting("strm")
+	}
+	if raw == "" && h.DB != nil {
+		var s model.Setting
+		if err := h.DB.Where("`key` = ?", "strm").First(&s).Error; err == nil {
+			raw = s.Value
+		}
+	}
+	if raw == "" {
 		return
 	}
 	var cfg struct {
@@ -568,22 +577,23 @@ func (h *Handler) getStrmConfig() (domain, format string, keepExt, exist bool) {
 		KeepExt any    `json:"keep_ext"`
 		Exist   string `json:"exist"`
 	}
-	if json.Unmarshal([]byte(s.Value), &cfg) == nil {
-		if cfg.Domain != "" {
-			domain = cfg.Domain
-		}
-		if cfg.Format != "" {
-			format = cfg.Format
-		}
-		switch v := cfg.KeepExt.(type) {
-		case bool:
-			keepExt = v
-		case string:
-			keepExt = v == "true"
-		}
-		if cfg.Exist == "skip" {
-			exist = true // skip=true 表示跳过已存在
-		}
+	if json.Unmarshal([]byte(raw), &cfg) != nil {
+		return
+	}
+	if cfg.Domain != "" {
+		domain = cfg.Domain
+	}
+	if cfg.Format != "" {
+		format = cfg.Format
+	}
+	switch v := cfg.KeepExt.(type) {
+	case bool:
+		keepExt = v
+	case string:
+		keepExt = v == "true"
+	}
+	if cfg.Exist == "skip" {
+		exist = true // skip=true 表示跳过已存在
 	}
 	return
 }
