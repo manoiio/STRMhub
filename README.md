@@ -2,7 +2,7 @@
 
 115 网盘 → 本地 STRM → Emby 直接播放的一站式自动化工具。
 
-StrmHub 把 115 网盘的媒体库映射为本地 STRM 文件供 Emby/Jellyfin 刮削入库，播放时通过 302 直链代理让播放器直连 115（不经过服务器转发、不消耗服务器带宽），并在一个界面里完成**同步、整理、洗版、重命名、元数据回传、消息机器人**的全部闭环。
+StrmHub 把 115 网盘的媒体库映射为本地 STRM 文件供 Emby/Jellyfin 刮削入库。标准播放请求通过 302 把播放器引向 115 直链；空 User-Agent 请求默认保留服务器中转兜底，也可通过环境变量关闭。同步、整理、洗版、重命名、元数据回传和消息机器人集中在一个界面中。
 
 ```mermaid
 flowchart LR
@@ -45,8 +45,8 @@ flowchart LR
 - 八种情形独立策略（缺失 / 命中 / 冲突高保护 / 冲突低保护 / 探测失败 / 完整命名等），每项可选「按探测结果改名」或「保留原名」，默认关闭、用户手动开启
 
 ### 播放与 Emby
-- **302 直链代理**（端口 6086）：STRM 内只存短链，播放时按客户端 Host 动态重写、定向到 115 直链，Emby 端强制 DirectPlay 不转码
-- **空白 UA 兼容**：部分播放器（手机端等）不带 UA，自动切换服务器中转流取链
+- **302 直链代理**（端口 6086）：Emby 播放请求经 StrmHub 取得 115 直链并返回 302；正常情况下视频数据不经 StrmHub 中转。
+- **空白 UA 兼容**：默认允许无 User-Agent 请求回退到服务器中转；设置 DISABLE_STREAM_PROXY=true 后禁用该回退，并对这类请求返回 503。
 - **元数据回传闭环**：Emby 刮削生成的 NFO / 海报 / 剧集图片保存到媒体目录后，监控上传自动回传 115 对应目录
 - **一键建库插件**：扫描本地媒体二层目录（如 `/media/电影/国产剧`），库名=目录名，自动配置中文元数据、NFO/图片本地保存、媒体路径（含路径映射）
 
@@ -59,9 +59,16 @@ flowchart LR
 - 115 API 全局限流（读 1s / 写 3s 分级，防风控），UI 可调
 - 日志轮转（10MB × 3 份），实时日志页按任务过滤
 - JWT 登录 + 登录防爆破（同 IP 连续 5 次失败锁定 10 分钟）；管理员账号由环境变量 `AUTH_USER` / `AUTH_PASSWORD` 提供
+- 上传下载页提供独立开关，可关闭后台离线任务监视和元数据回传兜底；不会关闭增量同步，已配置的监控上传也保持独立。
 - 115 OpenAPI（PKCE OAuth 授权 + Token 自动刷新）与 Cookie 双通道互备
 
-## 快速部署
+## macOS 原生部署（Apple Silicon）
+
+本 fork 附有 Apple Silicon 原生部署指南，不需要 Docker 或 Linux 虚拟机。运行程序、配置和 SQLite 建议保存在用户的 Application Support 目录；媒体输出路径可在账号同步配置中单独指定。构建要求 Go 1.25 或更新版本，前端 web 目录须与运行目录匹配。
+
+详细步骤和 LaunchAgent 示例见 [macOS 原生部署指南](docs/macos-native.md)。
+
+## Docker 快速部署
 
 ```bash
 mkdir strmhub && cd strmhub
@@ -111,16 +118,19 @@ services:
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `AUTH_USER` | — | **管理员用户名**（推荐在 compose 中显式配置） |
-| `AUTH_PASSWORD` | — | **管理员密码**；修改后 `docker compose up -d` 重启生效 |
+| `AUTH_USER` | — | **管理员用户名**（建议在服务启动环境变量中显式配置） |
+| `AUTH_PASSWORD` | — | **管理员密码**；更新启动环境变量后重启服务生效 |
 | `PORT` | 6060 | 管理后台端口 |
 | `PROXY_PORT` | 6086 | 302 代理端口 |
 | `DATA_DIR` | /data | 数据目录 |
 | `CONFIG_DIR` | /config | 配置目录 |
-| `JWT_SECRET` | 自动生成 | 登录令牌密钥；未设置时首启自动生成随机密钥存于 `/config/jwt.key`，重启不失效 |
+| `JWT_SECRET` | 自动生成 | 登录令牌密钥；未设置时首启自动生成随机密钥存于 `CONFIG_DIR/jwt.key`，重启不失效 |
 | `STRMHUB_115_INTERVAL` | 1000 | 115 读接口最小间隔（毫秒），数据库设置优先 |
+| `PORTAL_PORT` | 6688 | 观影门户端口。 |
+| `DISABLE_STREAM_PROXY` | false | 设置为 true 时，空 User-Agent 请求不再回退到服务端视频中转，并返回 503。 |
+| `STRMHUB_LOG_FILE` | 未设置 | 指定日志文件完整路径；macOS 默认使用用户日志目录，容器默认使用 /logs/app.log。 |
 
-> **管理员账号说明**：网页注册已移除。账号以环境变量 `AUTH_USER` / `AUTH_PASSWORD` 为准，每次启动自动同步；两者都未配置且无历史账号时，首次启动会自动生成随机密码并打印在容器日志（`docker logs strmhub`）。改环境变量即改密码，重启生效。
+> **管理员账号说明**：网页注册已移除。账号以环境变量 `AUTH_USER` / `AUTH_PASSWORD` 为准，每次启动自动同步；两者都未配置且无历史账号时，首次启动会生成随机密码并写入应用日志。Docker 用户可查看 `docker logs strmhub`；macOS 原生运行默认查看 `~/Library/Logs/STRMhub/app.log`，也可检查 LaunchAgent 标准输出日志。改环境变量即改密码，重启生效。
 
 ## 基本使用流程
 

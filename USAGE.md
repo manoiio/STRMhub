@@ -1,6 +1,6 @@
 # StrmHub 使用说明
 
-面向日常使用的操作手册。部署方式见 [README.md](README.md)。
+面向日常使用的操作手册。部署方式见 [README.md](README.md)；Apple Silicon 原生部署步骤见 [macOS 原生部署指南](docs/macos-native.md)。
 
 登录管理后台后，左侧菜单依次为：**仪表盘 / 账号管理 / 账号同步 / STRM 管理 / 自动整理 / 上传下载 / 系统配置 / 消息配置 / 扩展功能 / 实时日志**。地址栏与页面一一对应（`/sync`、`/organize`、`/plugins`……），可直接收藏或刷新。
 
@@ -10,7 +10,7 @@
 
 ## 1. 管理员账号与登录
 
-管理员账号由**容器环境变量**提供（网页注册已移除），在 `docker-compose.yml` 中配置：
+管理员凭据由启动环境变量 AUTH_USER / AUTH_PASSWORD 提供（网页注册已移除）。Docker 用户在 compose 中设置；macOS 原生用户可在 LaunchAgent 的 EnvironmentVariables 中设置。
 
 ```yaml
 environment:
@@ -19,9 +19,9 @@ environment:
 ```
 
 1. 浏览器打开 `http://IP:6060`，用上面的账号密码登录
-2. **改密码 = 改环境变量后重启容器**（启动时自动同步，环境变量为权威来源）
-3. 忘记密码：改环境变量重启即可；或 `docker exec strmhub ./strmhub --reset-admin` 删除凭据文件后重启重建
-4. 从未配置环境变量且无历史账号时，首次启动会自动生成随机密码（用户名 `admin`），在容器启动日志中查看：`docker logs strmhub`
+2. 更新 AUTH_USER / AUTH_PASSWORD 后重启服务生效；Docker 用户改 compose 并重启容器，macOS 用户按 LaunchAgent 指南重新加载。
+3. 忘记密码：Docker 可使用 docker exec strmhub ./strmhub --reset-admin；macOS 原生可先停止 LaunchAgent，再用相同 CONFIG_DIR 运行 strmhub --reset-admin，然后重新启动。
+4. 从未配置管理员环境变量且无历史账号时，首次启动会生成随机密码并写入应用日志；Docker 也可在容器日志中查看。
 
 ## 2. 账号管理（登录 115）
 
@@ -106,6 +106,17 @@ environment:
 
 ## 5. 上传下载
 
+### 后台服务开关
+
+在「上传下载」页可以分别控制两个后台任务：
+
+- **后台离线任务监视**：关闭后停止后台轮询和本页自动刷新；手动点击「刷新」仍可查询和提交任务。
+- **元数据回传兜底**：仅在「监控目录」未配置时，每 5 分钟扫描媒体目录并回传 NFO、海报等。关闭后停止后续兜底扫描，已经开始的一轮可能完成。
+- 单独配置的「监控上传」不受元数据回传兜底开关影响。
+- 增量同步与这两个开关无关。
+
+兼容已有安装：此前未保存过开关值时，两项默认开启；可在页面明确关闭。
+
 ### 监控上传（Emby 元数据回传 115）
 Emby 刮削生成的 NFO 与图片保存到媒体目录后，自动回传到 115 对应目录，形成闭环：
 
@@ -185,12 +196,20 @@ RE0 常态屏蔽大陆 IP：StrmHub 部署需能直连或为其配置代理。
 
 按任务分类的服务端日志实时滚动（3 秒刷新）。整理 / 同步 / 转存 / 插件 / 机器人操作都有对应前缀（`[整理]` `[同步]` `[插件]` …），可据此排查问题。
 
-## 10. 常见问题
+macOS 原生运行默认写入用户日志目录中的 STRMhub/app.log；LaunchAgent 的 stdout/stderr 文件单独保存。容器仍使用 /logs/app.log。也可用 STRMHUB_LOG_FILE 指定日志文件路径。
+
+## 10. macOS 原生部署（Apple Silicon）
+
+本 fork 的 macOS 原生路径不使用 Docker、OrbStack 或 Linux 虚拟机。推荐把源码仓库与运行数据分开：源码可以放在任意开发目录；程序、配置和数据库保存在用户的 Application Support 目录；媒体目录在账号同步页配置，可指向已挂载的外置卷。
+
+完整构建命令、目录布局、LaunchAgent 示例、启动与更新步骤见 [macOS 原生部署指南](docs/macos-native.md)。LaunchAgent 使用绝对路径，plist 中的用户名路径需要替换成当前 macOS 账户的实际路径。
+
+## 11. 常见问题
 
 **播放报错 / 黑屏？**
 1. 确认 Emby 挂载了同一个 `/media`，路径不一致去 EMBY 配置设置路径映射
-2. 播放时看 Emby 播放信息，应为 **DirectPlay**（直连）；出现转码说明文件在转码，检查客户端
-3. 手机播放器（空白 UA）失败会自动走服务器中转，无需配置
+2. 播放时查看 Emby 播放信息，应为 DirectPlay；出现转码说明客户端或播放设置触发了转码。
+3. 空 User-Agent 请求默认可能回退到服务器中转；设置 DISABLE_STREAM_PROXY=true 可禁止该回退，此类请求会返回 503。
 
 **提示「服务器开小差了」/ 操作失败？**
 115 风控。到账号管理把 API 间隔调大，等几分钟再试；写入操作固定 3 秒间隔无法跳过。
@@ -202,4 +221,4 @@ RE0 常态屏蔽大陆 IP：StrmHub 部署需能直连或为其配置代理。
 Emby 媒体库需勾选「将媒体封面保存到媒体文件夹」+ 元数据下载器启用；生成后监控上传会自动回传 115。
 
 **忘记密码 / 想改密码？**
-修改 compose 里的 `AUTH_PASSWORD` 后 `docker compose up -d` 重启即生效（环境变量为准）。或执行 `docker exec strmhub ./strmhub --reset-admin` 后重启，按环境变量重建（`/data` 内的同步数据保留）。
+Docker 用户可修改 compose 中的 AUTH_PASSWORD 并重启；macOS 原生部署按 LaunchAgent 指南处理。重置管理员凭据不会删除 SQLite 数据。
