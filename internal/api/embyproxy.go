@@ -121,7 +121,78 @@ func parseJSON(data string, out interface{}) error {
 }
 
 // playbackInfoPathRe 匹配 Emby 播放信息接口（/Items/{id}/PlaybackInfo）
-var playbackInfoPathRe = regexp.MustCompile(`(?i)^/items/[^/]+/playbackinfo$`)
+var playbackInfoPathRe = regexp.MustCompile(`(?i)^/items/([^/]+)/playbackinfo$`)
+
+// embyVideoStreamPathRe 匹配播放器随后调用的 Emby 流媒体端点。
+var embyVideoStreamPathRe = regexp.MustCompile(`(?i)^/videos/([^/]+)/stream(?:\.[^/]+)?$`)
+
+type embyDirectPlaybackEntry struct {
+	url       string
+	expiresAt time.Time
+}
+
+var (
+	embyDirectPlaybackMu    sync.Mutex
+	embyDirectPlaybackCache = map[string]embyDirectPlaybackEntry{}
+)
+
+func embyDirectPlaybackKey(itemID, mediaSourceID, clientHost string) string {
+	return itemID + "\x00" + mediaSourceID + "\x00" + clientHost
+}
+
+func cacheEmbyDirectPlayback(itemID, mediaSourceID, clientHost, directURL string) {
+	if itemID == "" || mediaSourceID == "" || directURL == "" {
+		return
+	}
+	now := time.Now()
+	key := embyDirectPlaybackKey(itemID, mediaSourceID, clientHost)
+	embyDirectPlaybackMu.Lock()
+	for k, entry := range embyDirectPlaybackCache {
+		if !now.Before(entry.expiresAt) {
+			delete(embyDirectPlaybackCache, k)
+		}
+	}
+	embyDirectPlaybackCache[key] = embyDirectPlaybackEntry{url: directURL, expiresAt: now.Add(30 * time.Minute)}
+	embyDirectPlaybackMu.Unlock()
+}
+
+func getCachedEmbyDirectPlayback(itemID, mediaSourceID, clientHost string) string {
+	if itemID == "" || mediaSourceID == "" {
+		return ""
+	}
+	key := embyDirectPlaybackKey(itemID, mediaSourceID, clientHost)
+	embyDirectPlaybackMu.Lock()
+	defer embyDirectPlaybackMu.Unlock()
+	entry, ok := embyDirectPlaybackCache[key]
+	if !ok {
+		return ""
+	}
+	if !time.Now().Before(entry.expiresAt) {
+		delete(embyDirectPlaybackCache, key)
+		return ""
+	}
+	return entry.url
+}
+
+// redirectEmbyVideoStream intercepts the playback URL Infuse actually requests.
+// It returns a 302 to the STRMhub /d/ endpoint before Emby can fetch or relay media.
+func redirectEmbyVideoStream(c *gin.Context, path string) bool {
+	if c.Request.Method != http.MethodGet && c.Request.Method != http.MethodHead {
+		return false
+	}
+	matches := embyVideoStreamPathRe.FindStringSubmatch(path)
+	if len(matches) != 2 {
+		return false
+	}
+	mediaSourceID := c.Request.URL.Query().Get("MediaSourceId")
+	directURL := getCachedEmbyDirectPlayback(matches[1], mediaSourceID, c.Request.Host)
+	if directURL == "" {
+		return false
+	}
+	vlog("[Emby直连] Emby stream URL 转 302: item=%s source=%s UA=%s", matches[1], mediaSourceID, c.Request.UserAgent())
+	c.Redirect(http.StatusFound, directURL)
+	return true
+}
 
 // itemDetailPathRe 匹配条目详情接口（GET /Users/{uid}/Items/{id}）——
 // 用户打开详情页 = 即将播放的强意图信号，此时预取直链比 PlaybackInfo
@@ -189,9 +260,11 @@ func rewritePlaybackInfo(db *gorm.DB, cfg *config.Config) func(*http.Response) e
 		if resp.Request == nil || resp.StatusCode != http.StatusOK {
 			return nil
 		}
-		if !playbackInfoPathRe.MatchString(resp.Request.URL.Path) {
+		pathMatch := playbackInfoPathRe.FindStringSubmatch(resp.Request.URL.Path)
+		if len(pathMatch) != 2 {
 			return nil
 		}
+		itemID := pathMatch[1]
 		if !strings.Contains(resp.Header.Get("Content-Type"), "json") {
 			return nil
 		}
@@ -248,13 +321,19 @@ func rewritePlaybackInfo(db *gorm.DB, cfg *config.Config) func(*http.Response) e
 				playerUA := resp.Request.Header.Get("User-Agent")
 				prefetchPickcodeLink(db, cfg, pc, playerUA)
 			}
+			mediaSourceID, _ := ms["Id"].(string)
+			cacheEmbyDirectPlayback(itemID, mediaSourceID, clientHost, directURL)
 			ms["Path"] = directURL
+			// Rewrite the actual MediaSourceInfo playback URL too. The observed
+			// Infuse request stayed on Emby's /Videos/{id}/stream when only Path
+			// was changed, making Emby fetch /d itself with an empty User-Agent.
+			ms["DirectStreamUrl"] = directURL
+			ms["AddApiKeyToDirectStreamUrl"] = false
 			ms["Protocol"] = "Http"
 			ms["SupportsDirectPlay"] = true
-			// DirectStream 必须关闭：它是"Emby 服务器拉流再转发"模式，
-			// 服务器容器访问 CDN 受限时必挂（App 还会因此退回转码 500）。
-			// 只留 DirectPlay，逼播放器自己直连 115 CDN
-			ms["SupportsDirectStream"] = false
+			// DirectStreamUrl now targets STRMhub /d/, which returns a redirect;
+			// the client follows it to 115 CDN without sending video bytes via Emby.
+			ms["SupportsDirectStream"] = true
 			ms["SupportsTranscoding"] = false
 			delete(ms, "TranscodingUrl")
 			if c := directURLContainer(directURL); c != "" {
@@ -549,6 +628,9 @@ func embyModifyResponse(db *gorm.DB, cfg *config.Config) func(*http.Response) er
 
 func registerEmbyProxy(r *gin.Engine, db *gorm.DB, cfg *config.Config) {
 	r.Any("/emby/*path", func(c *gin.Context) {
+		if redirectEmbyVideoStream(c, c.Param("path")) {
+			return
+		}
 		target := getEmbyTarget(db, cfg)
 		if target == "" {
 			c.JSON(http.StatusBadGateway, gin.H{"error": "未配置 Emby 服务器地址，请在「系统配置 → EMBY管理」填写"})
@@ -597,6 +679,9 @@ func registerEmbyProxy(r *gin.Engine, db *gorm.DB, cfg *config.Config) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 			return
 		}
+		if redirectEmbyVideoStream(c, p) {
+			return
+		}
 		// 反代到 Emby
 		target := getEmbyTarget(db, cfg)
 		if target == "" {
@@ -610,8 +695,11 @@ func registerEmbyProxy(r *gin.Engine, db *gorm.DB, cfg *config.Config) {
 				req.Host = targetURL.Host
 				req.URL.Scheme = targetURL.Scheme
 				req.URL.Host = targetURL.Host
+				req.Header.Del("Accept-Encoding")
+				req.Header.Set("X-Original-Host", c.Request.Host)
 			},
-			FlushInterval: -1,
+			FlushInterval:  -1,
+			ModifyResponse: embyModifyResponse(db, cfg),
 			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 				log.Printf("[Emby反代] 转发失败: %v", err)
 				http.Error(w, "Emby 服务器无法连接: "+err.Error(), http.StatusBadGateway)

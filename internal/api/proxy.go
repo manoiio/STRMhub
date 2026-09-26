@@ -169,6 +169,10 @@ func servePickcodeDirect(c *gin.Context, db *gorm.DB, cfg *config.Config, pickco
 	// 空 UA 客户端拿到 302 后去 CDN 取流会被拒（浏览器正常、这类手机播不动）。
 	// 改为服务端中转：用统一 UA 签发直链，把字节流转发给客户端（透传 Range）
 	if strings.TrimSpace(reqUA) == "" {
+		if config.StreamProxyDisabled() {
+			c.String(http.StatusServiceUnavailable, "空 User-Agent 请求的服务端视频中转已禁用")
+			return
+		}
 		log.Printf("302代理: %s UA 为空，转服务端中转拉流", pickcode)
 		streamVia(c, db, cfg, pickcode)
 		return

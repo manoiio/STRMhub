@@ -81,3 +81,19 @@ func getEnvInt(key string, fallback int) int {
 	}
 	return fallback
 }
+
+func getEnvBool(key string, fallback bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return fallback
+	}
+	return b
+}
+
+func StreamProxyDisabled() bool {
+	return getEnvBool("DISABLE_STREAM_PROXY", false)
+}
