@@ -64,7 +64,7 @@ flowchart LR
 
 ## macOS 原生部署（Apple Silicon）
 
-本 fork 附有 Apple Silicon 原生部署指南，不需要 Docker 或 Linux 虚拟机。运行程序、配置和 SQLite 建议保存在用户的 Application Support 目录；媒体输出路径可在账号同步配置中单独指定。构建要求 Go 1.25 或更新版本，前端 web 目录须与运行目录匹配。
+本 fork 附有 Apple Silicon 原生部署指南，不需要 Docker 或 Linux 虚拟机。程序、配置、SQLite 和应用日志保存在源码仓库的 `.runtime/` 目录；媒体输出路径可在账号同步配置中单独指定。构建要求 Go 1.25 或更新版本，前端 `web/` 目录须与运行目录匹配。
 
 详细步骤和 LaunchAgent 示例见 [macOS 原生部署指南](docs/macos-native.md)。
 
@@ -128,9 +128,9 @@ services:
 | `STRMHUB_115_INTERVAL` | 1000 | 115 读接口最小间隔（毫秒），数据库设置优先 |
 | `PORTAL_PORT` | 6688 | 观影门户端口。 |
 | `DISABLE_STREAM_PROXY` | false | 设置为 true 时，空 User-Agent 请求不再回退到服务端视频中转，并返回 503。 |
-| `STRMHUB_LOG_FILE` | 未设置 | 指定日志文件完整路径；macOS 默认使用用户日志目录，容器默认使用 /logs/app.log。 |
+| `STRMHUB_LOG_FILE` | 未设置 | 指定日志文件完整路径；macOS 默认使用源码目录 `.runtime/logs/app.log`，容器默认使用 `/logs/app.log`。 |
 
-> **管理员账号说明**：网页注册已移除。账号以环境变量 `AUTH_USER` / `AUTH_PASSWORD` 为准，每次启动自动同步；两者都未配置且无历史账号时，首次启动会生成随机密码并写入应用日志。Docker 用户可查看 `docker logs strmhub`；macOS 原生运行默认查看 `~/Library/Logs/STRMhub/app.log`，也可检查 LaunchAgent 标准输出日志。改环境变量即改密码，重启生效。
+> **管理员账号说明**：网页注册已移除。账号以环境变量 `AUTH_USER` / `AUTH_PASSWORD` 为准，每次启动自动同步；两者都未配置且无历史账号时，首次启动会生成随机密码并写入应用日志。Docker 用户可查看 `docker logs strmhub`；macOS 原生运行查看源码目录 `.runtime/logs/app.log`。改环境变量即改密码，重启生效。
 
 ## 基本使用流程
 

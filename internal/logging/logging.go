@@ -18,7 +18,7 @@ var activePath struct {
 }
 
 // OpenAppLog chooses and opens the application log file. Native macOS installs
-// keep it beside the LaunchAgent logs; container installs keep using /logs.
+// keep it in the source repository runtime directory; containers use /logs.
 func OpenAppLog() (*os.File, string, error) {
 	candidates := candidatePaths()
 	var failures []error
@@ -71,9 +71,10 @@ func candidatePaths() []string {
 	}
 
 	if runtime.GOOS == "darwin" {
-		if home, err := os.UserHomeDir(); err == nil && home != "" {
-			return []string{filepath.Join(home, "Library", "Logs", "STRMhub", "app.log"), filepath.Join("/logs", "app.log")}
-		}
+		// The native LaunchAgent runs with the source repository as its working
+		// directory, keeping runtime files alongside the source instead of in
+		// the user's Application Support or Logs directories.
+		return []string{filepath.Join(".runtime", "logs", "app.log")}
 	}
 
 	return []string{filepath.Join("/logs", "app.log")}

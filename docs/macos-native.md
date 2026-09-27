@@ -6,40 +6,40 @@
 
 - macOS Apple Silicon；项目要求 Go 1.25.0 或更新版本。
 - 当前 Go SQLite 驱动支持 CGO_ENABLED=0。
-- 运行时工作目录必须包含 web 目录：服务启动时会从相对路径 ./web 读取 HTML、CSS、JavaScript 和 vendor 资源。
+- 运行时工作目录必须是源码仓库 `/Volumes/XD20/Developer/STRMhub`：服务从仓库内的 `./web` 读取 HTML、CSS、JavaScript 和 vendor 资源。
 - ffmpeg / ffprobe 不是 STRM 生成和 302 基本链路的必需项。观影门户转封装和媒体信息补全需要安装相应命令，并确保 LaunchAgent 的 PATH 可找到它们。
 
-建议把源码、运行时文件和媒体目录分开：
+二进制、凭据、数据库和日志都放在仓库的 `.runtime/` 目录中；该目录已加入 `.gitignore`，不会进入 Git。程序不从 `~/Library/Application Support/STRMhub` 加载运行文件。
 
-    源码仓库：可放在任意开发目录，例如外置开发盘
-    ~/Library/Application Support/STRMhub/
-    ├── bin/strmhub
-    ├── config/          # 账号凭据、115 Cookie、应用配置、JWT 密钥
-    ├── data/            # SQLite 数据库
-    └── web/             # 与当前源码版本配套的前端静态文件
+    /Volumes/XD20/Developer/STRMhub/
+    ├── web/                         # 服务直接读取的前端静态资源
+    └── .runtime/
+        ├── bin/strmhub              # 本机构建的可执行文件
+        ├── config/                  # 账号凭据、115 Cookie、应用配置、JWT 密钥
+        ├── data/                    # SQLite 数据库
+        └── logs/                    # app.log
 
-    ~/Library/Logs/STRMhub/
-    ├── app.log
-    ├── stdout.log
-    └── stderr.log
+macOS 要求用户级 LaunchAgent 注册文件放在 `~/Library/LaunchAgents`；plist 中的程序、工作目录、配置、数据库和日志路径都指向上面的源码仓库。媒体输出目录仍由「账号管理 / 账号同步」中的本地媒体目录配置决定，与程序运行目录分开；迁移程序时不要擅自改动该媒体路径。
 
-媒体输出目录由「账号管理 / 账号同步」中的本地媒体目录配置决定，不由 DATA_DIR 或 CONFIG_DIR 决定。可以设为内置盘路径或已挂载外置盘路径。使用外置盘时，同步前确认卷已挂载并且当前用户可写。
+源码仓库位于外接卷时，首次启动可能触发 macOS 的“可移动宗卷”访问提示；允许 STRMhub 访问该卷后再确认服务启动。LaunchAgent 不设置外接卷上的 stdout/stderr 重定向，应用日志由程序直接写入 `.runtime/logs/app.log`。
 
 ## 构建与手动启动
 
 从源码仓库根目录执行：
 
-    RUNTIME="$HOME/Library/Application Support/STRMhub"
-    mkdir -p "$RUNTIME/bin" "$RUNTIME/config" "$RUNTIME/data" "$RUNTIME/web" "$HOME/Library/Logs/STRMhub"
-    chmod 700 "$RUNTIME/config" "$RUNTIME/data"
+    ROOT="/Volumes/XD20/Developer/STRMhub"
+    RUNTIME="$ROOT/.runtime"
+    mkdir -p "$RUNTIME/bin" "$RUNTIME/config" "$RUNTIME/data" "$RUNTIME/logs"
+    chmod 700 "$RUNTIME" "$RUNTIME/config" "$RUNTIME/data"
 
+    cd "$ROOT"
     CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o "$RUNTIME/bin/strmhub" .
-    cp -R web/. "$RUNTIME/web/"
 
-main.go 使用相对工作目录读取 ./web，因此手动启动和 LaunchAgent 都要将工作目录设为运行时目录。手动启动示例：
+`main.go` 使用相对路径读取 `./web`，所以手动启动和 LaunchAgent 的工作目录都必须是源码仓库根目录。手动启动示例：
 
-    cd "$RUNTIME"
-    CONFIG_DIR="$RUNTIME/config" DATA_DIR="$RUNTIME/data" ./bin/strmhub
+    cd "$ROOT"
+    CONFIG_DIR="$RUNTIME/config" DATA_DIR="$RUNTIME/data" \
+      STRMHUB_LOG_FILE="$RUNTIME/logs/app.log" "$RUNTIME/bin/strmhub"
 
 默认管理端口为 6060，302 代理端口为 6086，观影门户端口为 6688。启动后访问 http://127.0.0.1:6060。
 
@@ -47,7 +47,7 @@ main.go 使用相对工作目录读取 ./web，因此手动启动和 LaunchAgent
 
 ## LaunchAgent 示例
 
-先创建 ~/Library/LaunchAgents/com.strmhub.native.plist。把示例中的 yourname 换成当前 macOS 用户名；launchd 不会展开 ~、$HOME 或 Shell 变量，所以 ProgramArguments、WorkingDirectory、StandardOutPath、StandardErrorPath 和目录环境变量都必须写成绝对路径。
+先创建 `~/Library/LaunchAgents/com.strmhub.native.plist`。launchd 不会展开 `~`、`$HOME` 或 Shell 变量，所以所有路径都必须写成绝对路径。
 
     <?xml version="1.0" encoding="UTF-8"?>
     <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -57,21 +57,19 @@ main.go 使用相对工作目录读取 ./web，因此手动启动和 LaunchAgent
       <string>com.strmhub.native</string>
       <key>ProgramArguments</key>
       <array>
-        <string>/Users/yourname/Library/Application Support/STRMhub/bin/strmhub</string>
+        <string>/Volumes/XD20/Developer/STRMhub/.runtime/bin/strmhub</string>
       </array>
       <key>WorkingDirectory</key>
-      <string>/Users/yourname/Library/Application Support/STRMhub</string>
+      <string>/Volumes/XD20/Developer/STRMhub</string>
       <key>EnvironmentVariables</key>
       <dict>
         <key>CONFIG_DIR</key>
-        <string>/Users/yourname/Library/Application Support/STRMhub/config</string>
+        <string>/Volumes/XD20/Developer/STRMhub/.runtime/config</string>
         <key>DATA_DIR</key>
-        <string>/Users/yourname/Library/Application Support/STRMhub/data</string>
+        <string>/Volumes/XD20/Developer/STRMhub/.runtime/data</string>
+        <key>STRMHUB_LOG_FILE</key>
+        <string>/Volumes/XD20/Developer/STRMhub/.runtime/logs/app.log</string>
       </dict>
-      <key>StandardOutPath</key>
-      <string>/Users/yourname/Library/Logs/STRMhub/stdout.log</string>
-      <key>StandardErrorPath</key>
-      <string>/Users/yourname/Library/Logs/STRMhub/stderr.log</string>
       <key>RunAtLoad</key>
       <true/>
       <key>KeepAlive</key>
@@ -98,17 +96,17 @@ main.go 使用相对工作目录读取 ./web，因此手动启动和 LaunchAgent
 - 账号同步页面的本地媒体目录必须指向实际可写位置。Emby 媒体库添加同一个媒体目录；Infuse 通过 Emby 访问媒体库。
 - 标准播放链路应由 STRMhub 返回 302，把播放器引向 115 CDN。是否真正由客户端直连 CDN，要结合 Emby 的 Direct Play 状态、STRMhub 请求日志和播放器播放行为确认。
 - 默认情况下，空 User-Agent 请求允许服务器端中转回退。设置 DISABLE_STREAM_PROXY=true 后禁用该回退；无法按 302 获取直链的这类请求会返回 503。此设置不会关闭普通 302 路径。
-- macOS 日志默认写入 ~/Library/Logs/STRMhub/app.log；可用 STRMHUB_LOG_FILE 显式指定单独路径。网页实时日志读取当前进程实际选择的日志文件。
+- macOS 原生运行的默认日志位于仓库 `.runtime/logs/app.log`；LaunchAgent 示例不设置 `StandardOutPath` / `StandardErrorPath`，避免 `launchd` 无权打开外接卷上的重定向文件。网页实时日志读取当前进程实际选择的日志文件。
 
 ## 更新现有安装
 
-先停止 LaunchAgent，再从源码仓库构建并更新运行时二进制和 web 文件；配置与 SQLite 不需要从源码目录复制：
+先停止 LaunchAgent，再从源码仓库构建运行时二进制。服务直接读取源码仓库的 `web/`，配置与 SQLite 保存在仓库的 `.runtime/` 中：
 
     launchctl bootout "gui/$(id -u)/com.strmhub.native"
-    cd /path/to/STRMhub
-    RUNTIME="$HOME/Library/Application Support/STRMhub"
+    ROOT="/Volumes/XD20/Developer/STRMhub"
+    cd "$ROOT"
+    RUNTIME="$ROOT/.runtime"
     CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o "$RUNTIME/bin/strmhub" .
-    cp -R web/. "$RUNTIME/web/"
     launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.strmhub.native.plist"
 
-更新后确认管理页、115 登录状态和 STRMhub 日志正常。不要用源码更新覆盖 config、data 或媒体目录。
+更新后确认管理页、115 登录状态和 STRMhub 日志正常。不要用源码更新覆盖 `.runtime/config`、`.runtime/data` 或媒体目录。

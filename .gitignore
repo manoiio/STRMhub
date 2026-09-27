@@ -3,6 +3,9 @@
 strmhub
 strmhub.exe
 
+# 本机 macOS 运行时（凭据、数据库、日志与构建产物）
+.runtime/
+
 # 数据文件
 data/
 *.db

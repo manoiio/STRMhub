@@ -879,6 +879,29 @@ function resolveCID(inputId) {
 }
 
 // ==================== 全量同步 ====================
+async function startIncrementalSync() {
+  // The manual action uses the same library and local path as full sync.
+  await resolveInputCID('full-cid');
+  const cid = resolveCID('full-cid');
+  if (!cid || cid === '0') { toast('无法识别 115 目录：请点「选择目录」重新选择，或直接输入纯数字 cid'); return; }
+  const videoExt = getTags('video-ext');
+  if (!videoExt.length) { toast('请至少保留一个视频文件后缀'); return; }
+  try {
+    toast('增量同步进行中（正在读取 115 生活事件）...');
+    appendLog('开始增量同步（读取 115 生活事件并更新 STRM）...');
+    const data = await api('/sync/incremental', { method: 'POST', body: JSON.stringify({
+      cid: cid,
+      local_path: document.getElementById('full-local').value,
+      video_ext: videoExt,
+      image_ext: getTags('image-ext'),
+      data_ext: getTags('data-ext'),
+    }) });
+    const sum = data.summary || {};
+    toast(data.message || '增量同步完成');
+    appendLog(`任务完成: 增量同步 · 新事件 ${sum.events_fresh || 0}，视频 ${sum.videos || 0}，生成 STRM ${sum.strm_created || 0}，附属下载 ${sum.assets_downloaded || 0}；详细结果见服务端日志`);
+  } catch (e) { toast(e.message); }
+}
+
 async function startFullSync() {
   // 手填路径先解析成 cid（防抖解析可能还没触发），解析不了就拒绝执行，
   // 绝不能拿旧 dataset.cid 静默同步错误的目录

@@ -196,11 +196,11 @@ RE0 常态屏蔽大陆 IP：StrmHub 部署需能直连或为其配置代理。
 
 按任务分类的服务端日志实时滚动（3 秒刷新）。整理 / 同步 / 转存 / 插件 / 机器人操作都有对应前缀（`[整理]` `[同步]` `[插件]` …），可据此排查问题。
 
-macOS 原生运行默认写入用户日志目录中的 STRMhub/app.log；LaunchAgent 的 stdout/stderr 文件单独保存。容器仍使用 /logs/app.log。也可用 STRMHUB_LOG_FILE 指定日志文件路径。
+macOS 原生运行将应用日志写入源码目录 `.runtime/logs/app.log`。容器仍使用 `/logs/app.log`。也可用 `STRMHUB_LOG_FILE` 指定日志文件路径。
 
 ## 10. macOS 原生部署（Apple Silicon）
 
-本 fork 的 macOS 原生路径不使用 Docker、OrbStack 或 Linux 虚拟机。推荐把源码仓库与运行数据分开：源码可以放在任意开发目录；程序、配置和数据库保存在用户的 Application Support 目录；媒体目录在账号同步页配置，可指向已挂载的外置卷。
+本 fork 的 macOS 原生路径不使用 Docker、OrbStack 或 Linux 虚拟机。程序、配置、数据库和日志与源码一起保存在 `/Volumes/XD20/Developer/STRMhub/.runtime/`；媒体目录仍在账号同步页单独配置，可指向已挂载的外置卷。
 
 完整构建命令、目录布局、LaunchAgent 示例、启动与更新步骤见 [macOS 原生部署指南](docs/macos-native.md)。LaunchAgent 使用绝对路径，plist 中的用户名路径需要替换成当前 macOS 账户的实际路径。
 
