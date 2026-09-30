@@ -174,6 +174,7 @@ function showPage(id) {
   if (id === 'config-system') {
     loadTmdb();
     loadConfigs();
+    loadEmbyMediaProbeStatus();
     updateStrmExample();
   }
   if (id === 'config-accounts') { loadAccount(); pan123LoadUI(); }
@@ -1033,6 +1034,38 @@ async function saveBackgroundServiceToggle(key, enabled) {
     toast(enabled ? '后台服务已开启' : '后台服务已关闭');
   } catch (e) {
     renderBackgroundServiceToggle(elementId, current);
+    toast('保存失败：' + e.message);
+  }
+}
+
+async function loadEmbyMediaProbeStatus() {
+  const label = document.getElementById('emby-media-probe-status');
+  if (!label) return;
+  try {
+    const data = await api('/emby/media-info/status');
+    renderBackgroundServiceToggle('emby-media-probe-switch', data.enabled);
+    const s = data.status || {};
+    const summary = `${s.done || 0}/${s.total || 0}，成功 ${s.succeeded || 0}，失败 ${s.failed || 0}，暂缓重试 ${s.deferred || 0}`;
+    label.textContent = s.running
+      ? `运行中：${summary}`
+      : s.last_run ? `上轮：${summary}${s.last_error ? '；' + s.last_error : ''}`
+      : s.last_error || (data.enabled ? '已开启，等待下一轮扫描' : '已关闭');
+  } catch (e) {
+    label.textContent = '状态读取失败：' + e.message;
+  }
+}
+
+async function saveEmbyMediaProbeEnabled(enabled) {
+  renderBackgroundServiceToggle('emby-media-probe-switch', !enabled, true);
+  try {
+    await api('/config/setting', {
+      method: 'POST',
+      body: JSON.stringify({ key: 'emby-media-info-probe', value: JSON.stringify({ enabled }) }),
+    });
+    await loadEmbyMediaProbeStatus();
+    toast(enabled ? '自动补齐已开启' : '自动补齐已关闭');
+  } catch (e) {
+    await loadEmbyMediaProbeStatus();
     toast('保存失败：' + e.message);
   }
 }

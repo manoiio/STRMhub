@@ -215,6 +215,7 @@ func SetupRoutes(r *gin.RouterGroup, db *gorm.DB, cfg *config.Config) {
 
 	// 启动离线任务监视器（完成即触发整理；失败告警——磁力不是百分百成功）
 	StartOfflineTaskMonitor(h)
+	StartEmbyMediaProbeWorker(h)
 
 	// 媒体卷宽松权限（存量补 chmod，异步）
 	h.RelaxedMediaPerms()
@@ -288,6 +289,7 @@ func SetupRoutes(r *gin.RouterGroup, db *gorm.DB, cfg *config.Config) {
 
 		// Emby 连接测试
 		protected.POST("/config/test-emby", h.TestEmbyConnection)
+		protected.GET("/emby/media-info/status", h.EmbyMediaProbeStatus)
 
 		// 消息通知
 		protected.POST("/message/test", h.TestMessage)
@@ -343,6 +345,7 @@ func SetupRoutes(r *gin.RouterGroup, db *gorm.DB, cfg *config.Config) {
 
 		// STRM 管理
 		// 302 直连（与 6086 代理同款，6060 也能作为 strm 直连地址，CMS 二合一模式）
+		registerISOMetadataRoutes(r, h.DB, h.Config)
 		r.GET("/d/:pickcode", func(c *gin.Context) { handleProxyRedirect(c, h.DB, h.Config) })
 		r.GET("/d/:pickcode/*filename", func(c *gin.Context) { handleProxyRedirect(c, h.DB, h.Config) })
 		// 按需离线播放端点（与 6086 代理同款；二合一部署时占位 STRM 走主端口也能播）

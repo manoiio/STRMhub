@@ -148,31 +148,61 @@ func fetch115LifeEvents(cookie string, limit, offset int, typ string) ([]lifeEve
 	return events, nil
 }
 
-// get115DirInfo 查询目录自身的 cid/pid/名称（webapi files/get_info，data 为数组取首项）
+// get115ItemInfo 查询网盘对象的 cid/pid/名称和对象类型（webapi files/get_info）。
 type dirInfo struct {
 	cid, pid, n string
+	isDir       bool
+	kindKnown   bool
 }
 
-// get115DirInfo 查询目录自身的 cid/pid/名称
-func get115DirInfo(cookie, cid string) (dirInfo, error) {
+func get115ItemInfo(cookie, cid string) (dirInfo, error) {
 	body, err := httpGet115UA("https://webapi.115.com/files/get_info",
 		url.Values{"file_id": {cid}}, cookie, ua115Unified(), 15*time.Second)
 	if err != nil {
 		return dirInfo{}, err
 	}
 	var r struct {
-		State bool `json:"state"`
-		Data  []struct {
-			Cid string `json:"cid"`
-			Pid string `json:"pid"`
-			N   string `json:"n"`
-		} `json:"data"`
+		State bool            `json:"state"`
+		Data  json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(body, &r); err != nil || !r.State || len(r.Data) == 0 {
 		return dirInfo{}, fmt.Errorf("获取目录信息失败: %s", truncateStr(string(body), 120))
 	}
-	d := r.Data[0]
-	return dirInfo{cid: d.Cid, pid: d.Pid, n: d.N}, nil
+	var items []map[string]interface{}
+	dataJSON := strings.TrimSpace(string(r.Data))
+	if dataJSON == "null" || dataJSON == "" {
+		return dirInfo{}, fmt.Errorf("获取目录信息失败: %s", truncateStr(string(body), 120))
+	}
+	if strings.HasPrefix(dataJSON, "[") {
+		if err := json.Unmarshal(r.Data, &items); err != nil {
+			return dirInfo{}, fmt.Errorf("解析目录信息失败: %w", err)
+		}
+	} else {
+		var item map[string]interface{}
+		if err := json.Unmarshal(r.Data, &item); err != nil {
+			return dirInfo{}, fmt.Errorf("解析目录信息失败: %w", err)
+		}
+		items = append(items, item)
+	}
+	if len(items) == 0 {
+		return dirInfo{}, fmt.Errorf("获取目录信息失败: %s", truncateStr(string(body), 120))
+	}
+	d := items[0]
+	info := dirInfo{
+		cid: firstStr(d, "cid", "file_id", "fid"),
+		pid: firstStr(d, "pid", "parent_id"),
+		n:   firstStr(d, "n", "file_name", "name"),
+	}
+	if category := firstStr(d, "file_category", "fc", "f"); category != "" {
+		info.kindKnown = true
+		info.isDir = category == "0"
+	}
+	return info, nil
+}
+
+// get115DirInfo 保留已有目录调用点；移动事件会额外读取返回的对象类型。
+func get115DirInfo(cookie, cid string) (dirInfo, error) {
+	return get115ItemInfo(cookie, cid)
 }
 
 // get115RelPath 从 cid 逐级向上爬父目录链至 rootCid，返回相对路径（如 电影/香港动画/xxx）
@@ -187,7 +217,7 @@ func get115RelPath(cookie, cid, rootCid string, memo map[string]dirInfo) (string
 		info, ok := memo[cur]
 		if !ok {
 			var err error
-			info, err = get115DirInfo(cookie, cur)
+			info, err = get115ItemInfo(cookie, cur)
 			if err != nil {
 				return "", false, err
 			}
@@ -314,7 +344,7 @@ func (h *Handler) executeIncrementalSync(p incrParams) (*incrSummary, error) {
 	memo := map[string]dirInfo{}
 	// 媒体库根目录名（STRM 路径第一层）
 	libName := ""
-	if info, err := get115DirInfo(cookie, p.Cid); err == nil {
+	if info, err := get115ItemInfo(cookie, p.Cid); err == nil {
 		libName = info.n
 	}
 	libAbs := absPathOf(cookie, p.Cid, memo)
@@ -326,6 +356,7 @@ func (h *Handler) executeIncrementalSync(p incrParams) (*incrSummary, error) {
 		return sum, fmt.Errorf("媒体库 cid 无效（%s），增量同步中止（事件未消费，修正配置后重试即可补上）", p.Cid)
 	}
 	var excludedAbs []string
+	var excludedCids []string
 	var orgCfgRaw struct {
 		Pending   string `json:"pending"`
 		Existing  string `json:"existing"`
@@ -340,6 +371,7 @@ func (h *Handler) executeIncrementalSync(p incrParams) (*incrSummary, error) {
 	_ = json.Unmarshal([]byte(h.getSettingValue("share")), &shareCfgRaw)
 	for _, cid := range []string{orgCfgRaw.Pending, orgCfgRaw.Existing, orgCfgRaw.Redundant, shareCfgRaw.Folder} {
 		if cid != "" {
+			excludedCids = append(excludedCids, cid)
 			if a := absPathOf(cookie, cid, memo); a != "" {
 				excludedAbs = append(excludedAbs, strings.TrimSuffix(a, "/"))
 			}
@@ -376,7 +408,6 @@ func (h *Handler) executeIncrementalSync(p incrParams) (*incrSummary, error) {
 		}
 		return nil, lastErr
 	}
-	var pending []model.SyncEvent
 	pickByEvent := map[string]string{} // 事件 id → pick_code（落库结构不含，本轮内存携带）
 	offset := 0
 	for {
@@ -385,7 +416,6 @@ func (h *Handler) executeIncrementalSync(p incrParams) (*incrSummary, error) {
 			return sum, fmt.Errorf("拉取生活事件失败（已重试 3 次）: %w", err)
 		}
 		sum.EventsTotal += len(events)
-		fresh := 0
 		batch := make([]model.SyncEvent, 0, len(events))
 		for _, ev := range events {
 			if ev.ID == "" {
@@ -402,20 +432,8 @@ func (h *Handler) executeIncrementalSync(p incrParams) (*incrSummary, error) {
 		}
 		// 批量落库（此前逐条 Create：千级事件即千次独立写事务）。
 		// 新事件判定改为预查已存在的 event_id（批量插入拿不到单条 RowsAffected）
-		if n := insertSyncEvents(h.DB, batch); n > 0 {
-			fresh += n
-			dupInBatch := map[string]bool{}
-			for _, se := range batch {
-				if !dupInBatch[se.EventID] {
-					dupInBatch[se.EventID] = true
-					pending = append(pending, se)
-				}
-			}
-		}
-		batch = batch[:0]
+		fresh := insertSyncEvents(h.DB, batch)
 		sum.EventsFresh += fresh
-		if fresh > 0 {
-		}
 		if fresh == 0 || sum.EventsFresh >= p.Limit {
 			break // 已追平或达到单次上限
 		}
@@ -425,12 +443,12 @@ func (h *Handler) executeIncrementalSync(p incrParams) (*incrSummary, error) {
 		}
 	}
 
-	// 恢复上轮中断遗留的 pending 事件：此前只处理"本轮新插入"的行，
-	// 拉取中途失败/进程重启后已落库的事件永久滞留 pending，无人再消费
-	var stale []model.SyncEvent
-	h.DB.Where("status = ?", "pending").Order("event_time").Find(&stale)
-	if len(stale) > 0 {
-		pending = append(stale, pending...)
+	// 只应用台账里仍为 pending 的事件。不能把本页 batch 全部追加到待处理列表：
+	// 生活事件接口会重复返回旧事件；只要本页混有一条新事件，旧的 applied 事件
+	// 就会被再次执行（例如旧 folder_rename 会再次把整个 Anime 加入回退扫描）。
+	var pending []model.SyncEvent
+	if err := h.DB.Where("status = ?", "pending").Order("event_time").Find(&pending).Error; err != nil {
+		return sum, fmt.Errorf("读取待处理同步事件失败: %w", err)
 	}
 
 	// 事件按时间正序应用（接口返回最新在前）
@@ -471,6 +489,10 @@ func (h *Handler) executeIncrementalSync(p incrParams) (*incrSummary, error) {
 	}
 
 	dirSet := map[string]bool{}
+	// A move_file event can represent either a file or a directory. Directory
+	// moves are handled against the moved directory itself after all events are
+	// collected, so repeated moves in one batch resolve to the current path.
+	folderMoves := map[string]model.SyncEvent{}
 	// 零遍历清单：事件自带 pick_code 时直接用事件数据生成 strm，
 	// 不再重遍历受影响目录（CMS 同款；无 pick_code 的事件回退 dirSet 遍历）
 	type preciseFile struct {
@@ -478,6 +500,21 @@ func (h *Handler) executeIncrementalSync(p incrParams) (*incrSummary, error) {
 	}
 	var precise []preciseFile
 	fallbackDir := func(cid string) { dirSet[cid] = true }
+	applyFileMoveEvent := func(ev model.SyncEvent) {
+		// 移动/改名：清理旧位置只按台账精确匹配（事件的 Cid/FileName 均为
+		// 新位置信息，模糊删除会误删库内同名字幕树），新位置精确重建或回退遍历。
+		if h.removeSyncedItem(ev, cookie, p.Cid, p.LocalPath, memo, true, true) {
+			sum.Moved++
+		}
+		if ev.Cid != "" && scopeOf(ev.Cid) == "library" {
+			if pickByEvent[ev.EventID] != "" && ev.FileID != "" && isMedia(ev.FileName) {
+				precise = append(precise, preciseFile{ev: ev}) // 移入媒体库：事件直推重建
+			} else {
+				fallbackDir(ev.Cid)
+			}
+		}
+		sum.Structural++
+	}
 
 	for i, ev := range pending {
 		if i%50 == 0 {
@@ -534,32 +571,59 @@ func (h *Handler) executeIncrementalSync(p incrParams) (*incrSummary, error) {
 				}
 			}
 			sum.Structural++
-		case evMove, evMoveImage, evRename:
-			// 移动/改名：清理旧位置只按台账精确匹配（事件的 Cid/FileName 均为
-			// 新位置信息，模糊删除会误删库内同名字幕树），新位置精确重建或回退遍历
-			if h.removeSyncedItem(ev, cookie, p.Cid, p.LocalPath, memo, true, true) {
-				sum.Moved++
+		case evMove:
+			if ev.FileID == "" {
+				log.Printf("[同步] ⚠ 移动事件缺少文件/目录 ID（%s），保留事件待重试", ev.FileName)
+				sum.DirsSkipped++
+				sum.Structural++
+				continue
 			}
-			if ev.Cid != "" && scopeOf(ev.Cid) == "library" {
-				if pickByEvent[ev.EventID] != "" && ev.FileID != "" && isMedia(ev.FileName) {
-					precise = append(precise, preciseFile{ev: ev}) // 移入媒体库：事件直推重建
-				} else {
-					fallbackDir(ev.Cid)
-				}
+			info, infoErr := get115ItemInfo(cookie, ev.FileID)
+			if infoErr == nil && info.kindKnown && info.isDir {
+				invalidateDirAbsCache()
+				memo = map[string]dirInfo{}
+				folderMoves[ev.FileID] = ev // 同目录多次移动只按最终网盘位置处理
+				sum.Structural++
+				continue
 			}
-			sum.Structural++
-		case evFolderRename:
-			// 目录改名：目录结构已变，路径缓存整体失效
-			invalidateDirAbsCache()
-			// 重遍历父目录重建；旧名子树可能残留，交由后续清理功能
-			if ev.Cid != "" {
-				if sc := scopeOf(ev.Cid); sc == "excluded" || sc == "other" {
-					sum.Ignored++
+			if infoErr != nil || !info.kindKnown {
+				// 已同步文件可由台账确认其类型；其他无法判型的事件不能退化为
+				// 扫描目标父目录，否则移动一个目录可能重扫整个 Anime。
+				var tracked model.SyncedFile
+				if h.DB.Where("file_id = ?", ev.FileID).First(&tracked).Error != nil {
+					log.Printf("[同步] ⚠ 无法确认移动对象类型 ID=%s（%s），保留事件待重试", ev.FileID, ev.FileName)
+					sum.DirsSkipped++
 					sum.Structural++
 					continue
 				}
-				dirSet[ev.Cid] = true
 			}
+			applyFileMoveEvent(ev)
+		case evMoveImage, evRename:
+			applyFileMoveEvent(ev)
+		case evFolderRename:
+			// 目录改名：目录结构已变，路径缓存整体失效
+			invalidateDirAbsCache()
+			memo = map[string]dirInfo{}
+			// file_id 是被改名目录自身；只遍历该子树，避免改名一个目录就重扫整个父目录。
+			// 缺少或暂时无法解析目标时保留事件待重试，绝不退化为扫描父目录。
+			if ev.FileID == "" {
+				log.Printf("[同步] ⚠ 目录改名事件缺少目录 ID（%s），保留事件待重试", ev.FileName)
+				sum.DirsSkipped++
+				sum.Structural++
+				continue
+			}
+			switch sc := scopeOf(ev.FileID); sc {
+			case "excluded", "other":
+				sum.Ignored++
+				sum.Structural++
+				continue
+			case "unknown":
+				log.Printf("[同步] ⚠ 暂时无法解析改名目录 ID=%s（%s），保留事件待重试", ev.FileID, ev.FileName)
+				sum.DirsSkipped++
+				sum.Structural++
+				continue
+			}
+			dirSet[ev.FileID] = true
 			sum.Structural++
 		default:
 			sum.Structural++
@@ -573,6 +637,210 @@ func (h *Handler) executeIncrementalSync(p incrParams) (*incrSummary, error) {
 	noteShallow := func(base string) {
 		if shallowest == "" || len(base) < len(shallowest) {
 			shallowest = base
+		}
+	}
+
+	// 目录移动只读取被移动目录自身的子树，然后在本地做一次目录级 rename；
+	// 不把目标父目录放入 dirSet，避免把整个 Anime 之类的父树重新遍历。
+	if len(folderMoves) > 0 {
+		domain, format, keepExt, skipExist := h.getStrmConfig()
+		moves := make([]model.SyncEvent, 0, len(folderMoves))
+		for _, ev := range folderMoves {
+			moves = append(moves, ev)
+		}
+		sort.SliceStable(moves, func(i, j int) bool {
+			if moves[i].EventTime == moves[j].EventTime {
+				return moves[i].FileID < moves[j].FileID
+			}
+			return moves[i].EventTime < moves[j].EventTime
+		})
+		for _, ev := range moves {
+			SetTaskProgress("同步移动目录：" + ev.FileName)
+			invalidateDirAbsCache()
+			memo = map[string]dirInfo{}
+			excludedAbs = excludedAbs[:0]
+			for _, excludedCid := range excludedCids {
+				if abs := absPathOf(cookie, excludedCid, memo); abs != "" {
+					excludedAbs = append(excludedAbs, strings.TrimSuffix(abs, "/"))
+				}
+			}
+			rel, inLibrary, err := get115RelPath(cookie, ev.FileID, p.Cid, memo)
+			if err != nil {
+				log.Printf("[同步] 移动目录位置暂时无法解析 ID=%s（%s），保留事件待重试: %v", ev.FileID, ev.FileName, err)
+				sum.DirsSkipped++
+				continue
+			}
+			scope := scopeOf(ev.FileID)
+			rootObject := ev.FileID == p.Cid
+			if scope == "unknown" || (inLibrary && scope == "other" && !rootObject) || (!inLibrary && scope == "library") {
+				log.Printf("[同步] 移动目录作用域暂时无法确认 ID=%s（%s），保留事件待重试", ev.FileID, ev.FileName)
+				sum.DirsSkipped++
+				continue
+			}
+			destinationInScope := inLibrary && scope != "excluded" && (scope == "library" || rootObject)
+			if destinationInScope && libName == "" {
+				log.Printf("[同步] 媒体库名称暂时无法解析，移动目录保留待重试: %s", ev.FileName)
+				sum.DirsSkipped++
+				continue
+			}
+
+			var videos, assets []remoteFile
+			if err := walk115Dir(ops, ev.FileID, "", &videos, &assets, filter, nil); err != nil {
+				log.Printf("[同步] 移动目录子树读取失败 %s: %v，30 秒后重试一次", ev.FileName, err)
+				time.Sleep(30 * time.Second)
+				if retryErr := walk115Dir(ops, ev.FileID, "", &videos, &assets, filter, nil); retryErr != nil {
+					log.Printf("[同步] 移动目录子树重试仍失败 %s，保留事件待重试: %v", ev.FileName, retryErr)
+					sum.DirsSkipped++
+					continue
+				}
+			}
+			oldRel, trackedRows, err := inferSyncedDirectoryRoot(h.DB, videos, assets)
+			if err != nil {
+				log.Printf("[同步] 移动目录本地位置无法安全定位 %s，保留事件待重试: %v", ev.FileName, err)
+				sum.DirsSkipped++
+				continue
+			}
+			trackedCount := len(trackedRows)
+			if trackedCount > 0 && !relativePathWithin(libName, oldRel) {
+				log.Printf("[同步] 移动目录台账不在当前媒体库路径下，拒绝搬动: %s", oldRel)
+				sum.DirsSkipped++
+				continue
+			}
+
+			if destinationInScope {
+				folderAbs := strings.TrimSuffix(absPathOf(cookie, ev.FileID, memo), "/")
+				if folderAbs == "" {
+					log.Printf("[同步] 移动目录绝对路径暂时无法解析，保留事件待重试: %s", ev.FileName)
+					sum.DirsSkipped++
+					continue
+				}
+				var excludedRelPaths []string
+				for _, ex := range excludedAbs {
+					ex = strings.TrimSuffix(ex, "/")
+					if strings.HasPrefix(ex+"/", folderAbs+"/") {
+						relExcluded := strings.TrimPrefix(ex, folderAbs+"/")
+						if relExcluded != "" {
+							excludedRelPaths = append(excludedRelPaths, path.Clean(relExcluded))
+						}
+					}
+				}
+				inExcludedSubtree := func(rel string) bool {
+					rel = path.Clean(rel)
+					for _, excluded := range excludedRelPaths {
+						if rel == excluded || strings.HasPrefix(rel, excluded+"/") {
+							return true
+						}
+					}
+					return false
+				}
+				syncVideos := make([]remoteFile, 0, len(videos))
+				for _, f := range videos {
+					if !inExcludedSubtree(f.Path) {
+						syncVideos = append(syncVideos, f)
+					}
+				}
+				syncAssets := make([]remoteFile, 0, len(assets))
+				for _, f := range assets {
+					if !inExcludedSubtree(f.Path) {
+						syncAssets = append(syncAssets, f)
+					}
+				}
+				newRel := path.Join(libName, rel)
+				if trackedCount > 0 {
+					movedRows, moveErr := moveSyncedDirectory(h.DB, p.LocalPath, oldRel, newRel)
+					if moveErr != nil {
+						log.Printf("[同步] 移动本地目录失败 %s → %s，保留事件待重试: %v", oldRel, newRel, moveErr)
+						sum.DirsSkipped++
+						continue
+					}
+					if movedRows > 0 {
+						sum.Moved++
+						log.Printf("[同步] 已将本地目录整体移动 %s → %s（更新 %d 条台账）", oldRel, newRel, movedRows)
+					}
+				} else {
+					log.Printf("[同步] 移动目录没有旧同步台账，将只同步新位置子树: %s", newRel)
+				}
+				applyVideos := make([]remoteFile, 0, len(syncVideos))
+				for _, f := range syncVideos {
+					f.Path = path.Join(newRel, f.Path)
+					full, pathErr := syncLocalPath(p.LocalPath, path.Join(f.Path, f.Name+".strm"))
+					if pathErr != nil {
+						err = pathErr
+						break
+					}
+					if pathErr = ensureNoSymlinkParents(p.LocalPath, full); pathErr != nil {
+						err = pathErr
+						break
+					}
+					_, tracked := trackedRows[f.Fid]
+					info, statErr := os.Lstat(full)
+					if statErr != nil && !os.IsNotExist(statErr) {
+						err = fmt.Errorf("检查移动后的 STRM 失败 %s: %w", full, statErr)
+						break
+					}
+					if !tracked || os.IsNotExist(statErr) {
+						applyVideos = append(applyVideos, f)
+					} else if !info.Mode().IsRegular() {
+						err = fmt.Errorf("移动后的 STRM 不是普通文件: %s", full)
+						break
+					}
+				}
+				applyAssets := make([]remoteFile, 0, len(syncAssets))
+				if err == nil {
+					for _, f := range syncAssets {
+						f.Path = path.Join(newRel, f.Path)
+						full, pathErr := syncLocalPath(p.LocalPath, path.Join(f.Path, f.Name))
+						if pathErr != nil {
+							err = pathErr
+							break
+						}
+						if pathErr = ensureNoSymlinkParents(p.LocalPath, full); pathErr != nil {
+							err = pathErr
+							break
+						}
+						_, tracked := trackedRows[f.Fid]
+						info, statErr := os.Lstat(full)
+						if statErr != nil && !os.IsNotExist(statErr) {
+							err = fmt.Errorf("检查移动后的附属文件失败 %s: %w", full, statErr)
+							break
+						}
+						if !tracked || os.IsNotExist(statErr) {
+							applyAssets = append(applyAssets, f)
+						} else if !info.Mode().IsRegular() {
+							err = fmt.Errorf("移动后的附属文件不是普通文件: %s", full)
+							break
+						}
+					}
+				}
+				if err != nil {
+					log.Printf("[同步] 检查移动目录本地内容失败 %s，保留事件待重试: %v", rel, err)
+					sum.DirsSkipped++
+					continue
+				}
+				sc, dl, sk, fl := applySyncResults(h.DB, ops, applyVideos, applyAssets, p.LocalPath, domain, format, keepExt, skipExist, rel)
+				sum.Dirs++
+				sum.Videos += len(videos)
+				sum.StrmCreated += sc
+				sum.AssetsTotal += len(assets)
+				sum.AssetsDownloaded += dl
+				sum.AssetsSkipped += sk
+				sum.AssetsFailed += fl
+				sum.Relevant++
+				noteShallow(newRel)
+				log.Printf("[同步] 移动目录 %s：子树视频 %d 个，附属文件下载 %d 个", rel, len(videos), dl)
+			} else if trackedCount > 0 {
+				removed, removeErr := removeSyncedDirectory(h.DB, p.LocalPath, oldRel)
+				if removeErr != nil {
+					log.Printf("[同步] 移出媒体库的本地目录清理失败 %s，保留事件待重试: %v", oldRel, removeErr)
+					sum.DirsSkipped++
+					continue
+				}
+				sum.Deleted += removed
+				if removed > 0 {
+					noteShallow(oldRel)
+					log.Printf("[同步] 目录已移出媒体库，清理 %d 个已登记文件: %s", removed, oldRel)
+				}
+			}
 		}
 	}
 
@@ -676,7 +944,7 @@ func (h *Handler) executeIncrementalSync(p incrParams) (*incrSummary, error) {
 	// 逐目录遍历并立即落盘
 	domain, format, keepExt, skipExist := h.getStrmConfig()
 	for _, t := range uniqTargets {
-		noteShallow(t.base)
+		noteShallow(path.Join(libName, t.base))
 		var videos, assets []remoteFile
 		if err := walk115Dir(ops, t.cid, path.Join(libName, t.base), &videos, &assets, filter, nil); err != nil {
 			log.Printf("[同步] 遍历目录失败 %s: %v，30 秒后重试一次", t.base, err)
@@ -686,6 +954,15 @@ func (h *Handler) executeIncrementalSync(p incrParams) (*incrSummary, error) {
 				sum.DirsSkipped++
 				continue
 			}
+		}
+		movedPaths, err := rebaseSyncedFilePaths(h.DB, p.LocalPath, videos, assets)
+		if err != nil {
+			log.Printf("[同步] 同步文件旧路径迁移失败 %s: %v，保留事件待重试", t.base, err)
+			sum.DirsSkipped++
+			continue
+		}
+		if movedPaths > 0 {
+			log.Printf("[同步] %s：已将 %d 个同步文件迁移到新路径", t.base, movedPaths)
 		}
 		sc, dl, sk, fl := applySyncResults(h.DB, ops, videos, assets, p.LocalPath, domain, format, keepExt, skipExist, t.base)
 		sum.Dirs++
@@ -803,7 +1080,7 @@ func absPathOf(cookie, cid string, memo map[string]dirInfo) string {
 		info, ok := memo[cur]
 		if !ok {
 			var err error
-			info, err = get115DirInfo(cookie, cur)
+			info, err = get115ItemInfo(cookie, cur)
 			if err != nil {
 				return ""
 			}
@@ -823,6 +1100,459 @@ func absPathOf(cookie, cid string, memo map[string]dirInfo) string {
 	dirAbsCache[cid] = dirAbsEntry{path: result, at: time.Now()}
 	dirAbsMu.Unlock()
 	return result
+}
+
+// removeSyncedFile 按文件 id 从台账定位并删除本地文件（仅删除本工具生成过的文件）
+// rebaseSyncedFilePaths moves previously synced local files to their current
+// remote paths before the scan results upsert the ledger. This handles folder
+// renames without leaving the old local subtree behind. Only files owned by
+// the SyncedFile ledger are moved; unrelated files are never removed.
+func rebaseSyncedFilePaths(db *gorm.DB, localRoot string, videos, assets []remoteFile) (int, error) {
+	if db == nil {
+		return 0, nil
+	}
+	desiredByID := make(map[string]string, len(videos)+len(assets))
+	fileIDs := make([]string, 0, len(videos)+len(assets))
+	addDesiredPath := func(f remoteFile, kind string) error {
+		if f.Fid == "" || f.Fid == "<nil>" {
+			return nil
+		}
+		rel := path.Join(f.Path, f.Name)
+		if kind == "video" {
+			rel += ".strm"
+		}
+		if previous, ok := desiredByID[f.Fid]; ok {
+			if previous != rel {
+				return fmt.Errorf("同一文件 ID 对应多个目标路径: %s", f.Fid)
+			}
+			return nil
+		}
+		desiredByID[f.Fid] = rel
+		fileIDs = append(fileIDs, f.Fid)
+		return nil
+	}
+	for _, f := range videos {
+		if err := addDesiredPath(f, "video"); err != nil {
+			return 0, err
+		}
+	}
+	for _, f := range assets {
+		if err := addDesiredPath(f, "asset"); err != nil {
+			return 0, err
+		}
+	}
+	if len(fileIDs) == 0 {
+		return 0, nil
+	}
+
+	// Keep each SQLite query below conservative bind-variable limits.
+	const queryBatchSize = 400
+	var rows []model.SyncedFile
+	for start := 0; start < len(fileIDs); start += queryBatchSize {
+		end := start + queryBatchSize
+		if end > len(fileIDs) {
+			end = len(fileIDs)
+		}
+		var batch []model.SyncedFile
+		if err := db.Where("file_id IN ?", fileIDs[start:end]).Find(&batch).Error; err != nil {
+			return 0, fmt.Errorf("读取同步台账失败: %w", err)
+		}
+		rows = append(rows, batch...)
+	}
+
+	moved := 0
+	for _, row := range rows {
+		desiredRel, ok := desiredByID[row.FileID]
+		if !ok || path.Clean(row.RelPath) == desiredRel {
+			continue
+		}
+		oldPath, err := syncLocalPath(localRoot, row.RelPath)
+		if err != nil {
+			return moved, err
+		}
+		newPath, err := syncLocalPath(localRoot, desiredRel)
+		if err != nil {
+			return moved, err
+		}
+		oldInfo, err := os.Lstat(oldPath)
+		if os.IsNotExist(err) {
+			continue // the old file was already removed; applySyncResults will recreate it
+		}
+		if err != nil {
+			return moved, fmt.Errorf("检查旧同步文件失败 %s: %w", row.RelPath, err)
+		}
+		if !oldInfo.Mode().IsRegular() {
+			return moved, fmt.Errorf("旧同步路径不是普通文件，拒绝迁移: %s", row.RelPath)
+		}
+		if newInfo, statErr := os.Lstat(newPath); statErr == nil {
+			if os.SameFile(oldInfo, newInfo) {
+				continue
+			}
+			return moved, fmt.Errorf("新同步路径已存在其他文件，拒绝覆盖: %s", desiredRel)
+		} else if !os.IsNotExist(statErr) {
+			return moved, fmt.Errorf("检查新同步路径失败 %s: %w", desiredRel, statErr)
+		}
+		if err := os.MkdirAll(filepath.Dir(newPath), 0o777); err != nil {
+			return moved, fmt.Errorf("创建新同步目录失败 %s: %w", desiredRel, err)
+		}
+		if err := os.Rename(oldPath, newPath); err != nil {
+			return moved, fmt.Errorf("迁移同步文件 %s 到 %s 失败: %w", row.RelPath, desiredRel, err)
+		}
+		if err := db.Model(&model.SyncedFile{}).Where("file_id = ?", row.FileID).Update("rel_path", desiredRel).Error; err != nil {
+			rollbackErr := os.Rename(newPath, oldPath)
+			if rollbackErr != nil {
+				return moved, fmt.Errorf("更新台账失败且无法回滚文件 %s: %v; %w", desiredRel, rollbackErr, err)
+			}
+			return moved, fmt.Errorf("更新同步台账路径失败 %s: %w", desiredRel, err)
+		}
+		pruneEmptySyncDirs(filepath.Dir(oldPath), localRoot)
+		moved++
+	}
+	return moved, nil
+}
+
+// syncedArtifactPaths returns each remote file's path below the moved directory.
+// walk115Dir must be called with an empty base path for these relative paths.
+func syncedArtifactPaths(videos, assets []remoteFile) (map[string]string, error) {
+	paths := make(map[string]string, len(videos)+len(assets))
+	add := func(f remoteFile, kind string) error {
+		if f.Fid == "" || f.Fid == "<nil>" {
+			return nil
+		}
+		rel := path.Join(f.Path, f.Name)
+		if kind == "video" {
+			rel += ".strm"
+		}
+		rel = path.Clean(rel)
+		if rel == "." || strings.HasPrefix(rel, "../") || path.IsAbs(rel) {
+			return fmt.Errorf("移动目录中的同步文件路径无效: %q", rel)
+		}
+		if previous, ok := paths[f.Fid]; ok && previous != rel {
+			return fmt.Errorf("同一文件 ID 对应多个目录内路径: %s", f.Fid)
+		}
+		paths[f.Fid] = rel
+		return nil
+	}
+	for _, f := range videos {
+		if err := add(f, "video"); err != nil {
+			return nil, err
+		}
+	}
+	for _, f := range assets {
+		if err := add(f, "asset"); err != nil {
+			return nil, err
+		}
+	}
+	return paths, nil
+}
+
+func loadSyncedFilesByIDs(db *gorm.DB, fileIDs []string) (map[string]model.SyncedFile, error) {
+	rowsByID := make(map[string]model.SyncedFile)
+	if db == nil || len(fileIDs) == 0 {
+		return rowsByID, nil
+	}
+	unique := make([]string, 0, len(fileIDs))
+	seen := make(map[string]bool, len(fileIDs))
+	for _, id := range fileIDs {
+		if id != "" && id != "<nil>" && !seen[id] {
+			seen[id] = true
+			unique = append(unique, id)
+		}
+	}
+	const queryBatchSize = 400
+	for start := 0; start < len(unique); start += queryBatchSize {
+		end := start + queryBatchSize
+		if end > len(unique) {
+			end = len(unique)
+		}
+		var rows []model.SyncedFile
+		if err := db.Where("file_id IN ?", unique[start:end]).Find(&rows).Error; err != nil {
+			return nil, fmt.Errorf("读取同步台账失败: %w", err)
+		}
+		for _, row := range rows {
+			rowsByID[row.FileID] = row
+		}
+	}
+	return rowsByID, nil
+}
+
+// inferSyncedDirectoryRoot derives the old local directory from the stable file
+// IDs and their paths relative to the moved remote directory. It fails closed
+// unless every tracked descendant points to the same local directory root.
+func inferSyncedDirectoryRoot(db *gorm.DB, videos, assets []remoteFile) (string, map[string]model.SyncedFile, error) {
+	paths, err := syncedArtifactPaths(videos, assets)
+	if err != nil {
+		return "", nil, err
+	}
+	ids := make([]string, 0, len(paths))
+	for id := range paths {
+		ids = append(ids, id)
+	}
+	rows, err := loadSyncedFilesByIDs(db, ids)
+	if err != nil {
+		return "", nil, err
+	}
+	root := ""
+	for id, row := range rows {
+		suffix := paths[id]
+		oldRel := path.Clean(row.RelPath)
+		candidate := ""
+		if oldRel == suffix {
+			return "", nil, fmt.Errorf("无法从台账路径定位移动目录: %s", row.RelPath)
+		}
+		marker := "/" + suffix
+		if !strings.HasSuffix(oldRel, marker) {
+			return "", nil, fmt.Errorf("台账路径与移动目录内容不匹配: %s", row.RelPath)
+		}
+		candidate = strings.TrimSuffix(oldRel, marker)
+		if candidate == "" || candidate == "." {
+			return "", nil, fmt.Errorf("无法从台账路径定位移动目录: %s", row.RelPath)
+		}
+		if root == "" {
+			root = candidate
+		} else if root != candidate {
+			return "", nil, fmt.Errorf("移动目录的同步文件指向多个本地目录: %s 与 %s", root, candidate)
+		}
+	}
+	return root, rows, nil
+}
+
+func syncedRowsUnderPath(db *gorm.DB, rel string) ([]model.SyncedFile, error) {
+	if db == nil {
+		return nil, nil
+	}
+	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(rel)
+	var rows []model.SyncedFile
+	if err := db.Where("rel_path = ? OR rel_path LIKE ? ESCAPE '\\'", rel, escaped+"/%").Find(&rows).Error; err != nil {
+		return nil, fmt.Errorf("读取同步目录台账失败: %w", err)
+	}
+	return rows, nil
+}
+
+func relativePathWithin(root, candidate string) bool {
+	root, candidate = path.Clean(root), path.Clean(candidate)
+	return root != "." && candidate != "." && (candidate == root || strings.HasPrefix(candidate, root+"/"))
+}
+
+func rewriteSyncedDirectoryRows(db *gorm.DB, rows []model.SyncedFile, oldRel, newRel string) error {
+	if len(rows) == 0 {
+		return fmt.Errorf("移动目录没有对应的同步台账记录")
+	}
+	return db.Transaction(func(tx *gorm.DB) error {
+		for _, row := range rows {
+			suffix := strings.TrimPrefix(row.RelPath, oldRel)
+			newPath := newRel + suffix
+			if err := tx.Model(&model.SyncedFile{}).Where("id = ?", row.ID).Update("rel_path", newPath).Error; err != nil {
+				return fmt.Errorf("更新同步台账路径失败 %s: %w", row.RelPath, err)
+			}
+		}
+		return nil
+	})
+}
+
+// moveSyncedDirectory moves the whole local directory and rebases every ledger
+// path below it. Existing targets and path escapes are rejected without replace.
+func moveSyncedDirectory(db *gorm.DB, localRoot, oldRel, newRel string) (int, error) {
+	oldRel, newRel = path.Clean(oldRel), path.Clean(newRel)
+	if oldRel == "." || newRel == "." || strings.HasPrefix(oldRel, "../") || strings.HasPrefix(newRel, "../") {
+		return 0, fmt.Errorf("移动目录相对路径无效")
+	}
+	if oldRel == newRel {
+		return 0, nil
+	}
+	if strings.HasPrefix(newRel, oldRel+"/") || strings.HasPrefix(oldRel, newRel+"/") {
+		return 0, fmt.Errorf("移动目录的新旧路径存在嵌套关系，拒绝操作")
+	}
+	oldPath, err := syncLocalPath(localRoot, oldRel)
+	if err != nil {
+		return 0, err
+	}
+	newPath, err := syncLocalPath(localRoot, newRel)
+	if err != nil {
+		return 0, err
+	}
+	rows, err := syncedRowsUnderPath(db, oldRel)
+	if err != nil {
+		return 0, err
+	}
+	if len(rows) == 0 {
+		return 0, fmt.Errorf("移动目录没有对应的同步台账记录")
+	}
+	conflicts, err := syncedRowsUnderPath(db, newRel)
+	if err != nil {
+		return 0, err
+	}
+	if len(conflicts) > 0 {
+		return 0, fmt.Errorf("目标目录已有同步台账内容，拒绝覆盖: %s", newRel)
+	}
+	if err := ensureNoSymlinkParents(localRoot, oldPath); err != nil {
+		return 0, err
+	}
+	if err := ensureNoSymlinkParents(localRoot, newPath); err != nil {
+		return 0, err
+	}
+	oldInfo, err := os.Lstat(oldPath)
+	if os.IsNotExist(err) {
+		if _, statErr := os.Lstat(newPath); statErr == nil {
+			return 0, fmt.Errorf("旧目录不存在但目标路径已存在，拒绝认领: %s", newRel)
+		} else if !os.IsNotExist(statErr) {
+			return 0, fmt.Errorf("检查新目录失败 %s: %w", newRel, statErr)
+		}
+		// 本地旧目录已不存在时只更新台账，后续 applySyncResults 会按远端内容重建。
+		if err := rewriteSyncedDirectoryRows(db, rows, oldRel, newRel); err != nil {
+			return 0, err
+		}
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("检查旧同步目录失败 %s: %w", oldRel, err)
+	}
+	if !oldInfo.IsDir() || oldInfo.Mode()&os.ModeSymlink != 0 {
+		return 0, fmt.Errorf("旧同步路径不是普通目录，拒绝迁移: %s", oldRel)
+	}
+	if _, err := os.Lstat(newPath); err == nil {
+		return 0, fmt.Errorf("目标目录已存在，拒绝覆盖: %s", newRel)
+	} else if !os.IsNotExist(err) {
+		return 0, fmt.Errorf("检查新同步目录失败 %s: %w", newRel, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(newPath), 0o777); err != nil {
+		return 0, fmt.Errorf("创建新同步目录父路径失败 %s: %w", newRel, err)
+	}
+	if err := os.Rename(oldPath, newPath); err != nil {
+		return 0, fmt.Errorf("移动本地目录 %s 到 %s 失败: %w", oldRel, newRel, err)
+	}
+	if err := rewriteSyncedDirectoryRows(db, rows, oldRel, newRel); err != nil {
+		rollbackErr := os.Rename(newPath, oldPath)
+		if rollbackErr != nil {
+			return 0, fmt.Errorf("更新台账失败且无法回滚目录 %s: %v; %w", newRel, rollbackErr, err)
+		}
+		return 0, err
+	}
+	pruneEmptySyncDirs(filepath.Dir(oldPath), localRoot)
+	return len(rows), nil
+}
+
+func removeSyncedDirectory(db *gorm.DB, localRoot, oldRel string) (int, error) {
+	rows, err := syncedRowsUnderPath(db, oldRel)
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	for _, row := range rows {
+		full, err := syncLocalPath(localRoot, row.RelPath)
+		if err != nil {
+			return removed, err
+		}
+		if err := ensureNoSymlinkParents(localRoot, full); err != nil {
+			return removed, err
+		}
+		info, err := os.Lstat(full)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return removed, fmt.Errorf("检查同步文件失败 %s: %w", row.RelPath, err)
+		}
+		if !info.Mode().IsRegular() {
+			return removed, fmt.Errorf("同步台账路径不是普通文件，拒绝删除: %s", row.RelPath)
+		}
+		if err := os.Remove(full); err != nil {
+			return removed, fmt.Errorf("删除同步文件失败 %s: %w", row.RelPath, err)
+		}
+		removed++
+	}
+	ids := make([]uint, 0, len(rows))
+	for _, row := range rows {
+		ids = append(ids, row.ID)
+	}
+	if len(ids) > 0 {
+		if err := db.Transaction(func(tx *gorm.DB) error {
+			return tx.Where("id IN ?", ids).Delete(&model.SyncedFile{}).Error
+		}); err != nil {
+			return removed, fmt.Errorf("清理移动目录台账失败: %w", err)
+		}
+	}
+	for _, row := range rows {
+		full, err := syncLocalPath(localRoot, row.RelPath)
+		if err == nil {
+			pruneEmptySyncDirs(filepath.Dir(full), localRoot)
+		}
+	}
+	return removed, nil
+}
+
+func ensureNoSymlinkParents(localRoot, fullPath string) error {
+	root, err := filepath.Abs(localRoot)
+	if err != nil {
+		return fmt.Errorf("解析本地同步根目录失败: %w", err)
+	}
+	rel, err := filepath.Rel(root, fullPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("同步路径越过本地根目录: %s", fullPath)
+	}
+	rootInfo, err := os.Lstat(root)
+	if err != nil {
+		return fmt.Errorf("检查本地同步根目录失败: %w", err)
+	}
+	if rootInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("本地同步根目录是符号链接，拒绝操作: %s", root)
+	}
+	cur := root
+	parts := strings.Split(rel, string(filepath.Separator))
+	for i, part := range parts {
+		cur = filepath.Join(cur, part)
+		info, err := os.Lstat(cur)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("检查同步路径失败 %s: %w", cur, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("同步路径包含符号链接，拒绝操作: %s", cur)
+		}
+		if i < len(parts)-1 && !info.IsDir() {
+			return fmt.Errorf("同步路径父项不是目录: %s", cur)
+		}
+	}
+	return nil
+}
+
+func syncLocalPath(localRoot, rel string) (string, error) {
+	root, err := filepath.Abs(localRoot)
+	if err != nil {
+		return "", fmt.Errorf("解析本地同步根目录失败: %w", err)
+	}
+	nativeRel := filepath.FromSlash(rel)
+	if nativeRel == "" || filepath.IsAbs(nativeRel) {
+		return "", fmt.Errorf("同步相对路径无效: %q", rel)
+	}
+	full := filepath.Clean(filepath.Join(root, nativeRel))
+	underRoot, err := filepath.Rel(root, full)
+	if err != nil || underRoot == ".." || strings.HasPrefix(underRoot, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("同步路径越过本地根目录: %q", rel)
+	}
+	return full, nil
+}
+
+func pruneEmptySyncDirs(dir, localRoot string) {
+	root, err := filepath.Abs(localRoot)
+	if err != nil {
+		return
+	}
+	for dir = filepath.Clean(dir); dir != root; dir = filepath.Dir(dir) {
+		underRoot, err := filepath.Rel(root, dir)
+		if err != nil || underRoot == "." || underRoot == ".." || strings.HasPrefix(underRoot, ".."+string(filepath.Separator)) {
+			return
+		}
+		info, err := os.Lstat(dir)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return
+		}
+		if err := os.Remove(dir); err != nil {
+			return // non-empty directories may contain user-managed files
+		}
+	}
 }
 
 // removeSyncedFile 按文件 id 从台账定位并删除本地文件（仅删除本工具生成过的文件）

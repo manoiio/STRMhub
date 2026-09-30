@@ -61,6 +61,8 @@ func StartProxy(db *gorm.DB, cfg *config.Config) {
 	r.GET("/wecom/callback", botHandler.WecomCallback)
 	r.POST("/wecom/callback", botHandler.WecomCallback)
 
+	registerISOMetadataRoutes(r, db, cfg)
+
 	// 302 代理核心路由: /d/{pickcode} 或 /d/{pickcode}/{filename}
 	r.GET("/d/:pickcode", func(c *gin.Context) {
 		handleProxyRedirect(c, db, cfg)
